@@ -46,6 +46,10 @@ DEFAULTS = OrderedDict([
         "choices": ["intermediate", "modern"]}),
     ("security.postfix.compatibility", {"type": "enum", "default": "intermediate",
         "choices": ["intermediate", "modern"]}),
+    ("smtp.relay.host", {"type": "string", "default": ""}),
+    ("smtp.relay.port", {"type": "int", "default": 587}),
+    ("smtp.relay.user", {"type": "string", "default": ""}),
+    ("smtp.relay.password", {"type": "string", "default": ""}),
 ])
 
 
