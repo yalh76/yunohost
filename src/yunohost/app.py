@@ -156,9 +156,17 @@ def app_info(app, full=False):
 
 
 def _app_upgradable(app_infos):
+    from packaging import version
 
     # Determine upgradability
     # In case there is neither update_time nor install_time, we assume the app can/has to be upgraded
+
+    # Firstly use the version to know if an upgrade is available
+    if app_infos["version"] != "-" and app_infos["from_catalog"]["manifest"].get("version", None):
+        if version.parse(app_infos["version"]) < version.parse(app_infos["from_catalog"]["manifest"].get("version", "-")):
+            return "yes"
+        else:
+            return "no"
 
     if not app_infos.get("from_catalog", None):
         return "url_required"
@@ -347,6 +355,7 @@ def app_change_url(operation_logger, app, domain, path):
     env_dict["YNH_APP_ID"] = app_id
     env_dict["YNH_APP_INSTANCE_NAME"] = app
     env_dict["YNH_APP_INSTANCE_NUMBER"] = str(app_instance_nb)
+    env_dict["YNH_APP_MANIFEST_VERSION"] = manifest.get("version", "?")
 
     env_dict["YNH_APP_OLD_DOMAIN"] = old_domain
     env_dict["YNH_APP_OLD_PATH"] = old_path
@@ -410,7 +419,7 @@ def app_change_url(operation_logger, app, domain, path):
     hook_callback('post_app_change_url', args=args_list, env=env_dict)
 
 
-def app_upgrade(app=[], url=None, file=None):
+def app_upgrade(app=[], url=None, file=None, force=False):
     """
     Upgrade app
 
@@ -420,6 +429,7 @@ def app_upgrade(app=[], url=None, file=None):
         url -- Git url to fetch for upgrade
 
     """
+    from packaging import version
     from yunohost.hook import hook_add, hook_remove, hook_exec, hook_callback
     from yunohost.permission import permission_sync_to_user
 
@@ -459,11 +469,41 @@ def app_upgrade(app=[], url=None, file=None):
         elif app_dict["upgradable"] == "url_required":
             logger.warning(m18n.n('custom_app_url_required', app=app_instance_name))
             continue
-        elif app_dict["upgradable"] == "yes":
+        elif app_dict["upgradable"] == "yes" or force:
             manifest, extracted_app_folder = _fetch_app_from_git(app_instance_name)
         else:
             logger.success(m18n.n('app_already_up_to_date', app=app_instance_name))
             continue
+
+        # Manage upgrade type and avoid any upgrade if there are nothing to do
+        upgrade_type = "UNKNOWN"
+        # Get current_version and new version
+        app_new_version = manifest.get("version", "?")
+        app_current_version = app_dict.get("version", "?")
+
+        if True or manifest.get('integration', {}).get("upgrade_only_if_version_changes", None) is True:
+
+            # do only the upgrade if there are a change
+            if version.parse(app_current_version) >= version.parse(app_new_version) and not force:
+                logger.success(m18n.n('app_already_up_to_date', app=app_instance_name))
+                # Save update time
+                now = int(time.time())
+                app_setting(app_instance_name, 'update_time', now)
+                app_setting(app_instance_name, 'current_revision', manifest.get('remote', {}).get('revision', "?"))
+                continue
+            elif version.parse(app_current_version) > version.parse(app_new_version):
+                upgrade_type = "DOWNGRADE_FORCED"
+            elif app_current_version == app_new_version:
+                upgrade_type = "UPGRADE_FORCED"
+            elif "~ynh" in app_current_version and "~ynh" in app_new_version:
+                app_current_version_upstream, app_current_version_pkg = app_current_version.split("~ynh")
+                app_new_version_upstream, app_new_version_pkg = app_new_version.split("~ynh")
+                if app_current_version_upstream == app_new_version_upstream:
+                    upgrade_type = "UPGRADE_PACKAGE"
+                elif app_current_version_pkg == app_new_version_pkg:
+                    upgrade_type = "UPGRADE_APP"
+                else:
+                    upgrade_type = "UPGRADE_FULL"
 
         # Check requirements
         _check_manifest_requirements(manifest, app_instance_name=app_instance_name)
@@ -483,6 +523,9 @@ def app_upgrade(app=[], url=None, file=None):
         env_dict["YNH_APP_ID"] = app_id
         env_dict["YNH_APP_INSTANCE_NAME"] = app_instance_name
         env_dict["YNH_APP_INSTANCE_NUMBER"] = str(app_instance_nb)
+        env_dict["YNH_APP_UPGRADE_TYPE"] = upgrade_type
+        env_dict["YNH_APP_MANIFEST_VERSION"] = app_new_version
+        env_dict["YNH_APP_CURRENT_VERSION"] = app_current_version
 
         # Start register change on system
         related_to = [('app', app_instance_name)]
@@ -695,6 +738,7 @@ def app_install(operation_logger, app, label=None, args=None, no_remove_on_failu
     env_dict["YNH_APP_ID"] = app_id
     env_dict["YNH_APP_INSTANCE_NAME"] = app_instance_name
     env_dict["YNH_APP_INSTANCE_NUMBER"] = str(instance_number)
+    env_dict["YNH_APP_MANIFEST_VERSION"] = manifest.get("version", "?")
 
     # Start register change on system
     operation_logger.extra.update({'env': env_dict})
@@ -803,6 +847,7 @@ def app_install(operation_logger, app, label=None, args=None, no_remove_on_failu
             env_dict_remove["YNH_APP_ID"] = app_id
             env_dict_remove["YNH_APP_INSTANCE_NAME"] = app_instance_name
             env_dict_remove["YNH_APP_INSTANCE_NUMBER"] = str(instance_number)
+            env_dict["YNH_APP_MANIFEST_VERSION"] = manifest.get("version", "?")
 
             # Execute remove script
             operation_logger_remove = OperationLogger('remove_on_failed_install',
@@ -980,6 +1025,7 @@ def app_remove(operation_logger, app):
     env_dict["YNH_APP_ID"] = app_id
     env_dict["YNH_APP_INSTANCE_NAME"] = app
     env_dict["YNH_APP_INSTANCE_NUMBER"] = str(app_instance_nb)
+    env_dict["YNH_APP_MANIFEST_VERSION"] = manifest.get("version", "?")
     operation_logger.extra.update({'env': env_dict})
     operation_logger.flush()
 
