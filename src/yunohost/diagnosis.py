@@ -24,8 +24,10 @@
     Look for possible issues on the server
 """
 
+import re
 import os
 import time
+import smtplib
 
 from moulinette import m18n, msettings
 from moulinette.utils import log
@@ -38,13 +40,38 @@ logger = log.getActionLogger('yunohost.diagnosis')
 
 DIAGNOSIS_CACHE = "/var/cache/yunohost/diagnosis/"
 DIAGNOSIS_CONFIG_FILE = '/etc/yunohost/diagnosis.yml'
+DIAGNOSIS_SERVER = "diagnosis.yunohost.org"
+
 
 def diagnosis_list():
     all_categories_names = [h for h, _ in _list_diagnosis_categories()]
     return {"categories": all_categories_names}
 
 
-def diagnosis_show(categories=[], issues=False, full=False, share=False):
+def diagnosis_get(category, item):
+
+    # Get all the categories
+    all_categories = _list_diagnosis_categories()
+    all_categories_names = [c for c, _ in all_categories]
+
+    if category not in all_categories_names:
+        raise YunohostError('diagnosis_unknown_categories', categories=category)
+
+    if isinstance(item, list):
+        if any("=" not in criteria for criteria in item):
+            raise YunohostError("Criterias should be of the form key=value (e.g. domain=yolo.test)")
+
+        # Convert the provided criteria into a nice dict
+        item = {c.split("=")[0]: c.split("=")[1] for c in item}
+
+    return Diagnoser.get_cached_report(category, item=item)
+
+
+def diagnosis_show(categories=[], issues=False, full=False, share=False, human_readable=False):
+
+    if not os.path.exists(DIAGNOSIS_CACHE):
+        logger.warning(m18n.n("diagnosis_never_ran_yet"))
+        return
 
     # Get all the categories
     all_categories = _list_diagnosis_categories()
@@ -56,28 +83,19 @@ def diagnosis_show(categories=[], issues=False, full=False, share=False):
     else:
         unknown_categories = [c for c in categories if c not in all_categories_names]
         if unknown_categories:
-            raise YunohostError('diagnosis_unknown_categories', categories=", ".join(categories))
-
-    if not os.path.exists(DIAGNOSIS_CACHE):
-        logger.warning(m18n.n("diagnosis_never_ran_yet"))
-        return
+            raise YunohostError('diagnosis_unknown_categories', categories=", ".join(unknown_categories))
 
     # Fetch all reports
     all_reports = []
     for category in categories:
-        if not os.path.exists(Diagnoser.cache_file(category)):
-            logger.warning(m18n.n("diagnosis_no_cache", category=category))
-            report = {"id": category,
-                      "cached_for": -1,
-                      "timestamp": -1,
-                      "items": []}
-            Diagnoser.i18n(report)
-        else:
-            try:
-                report = Diagnoser.get_cached_report(category)
-            except Exception as e:
-                logger.error(m18n.n("diagnosis_failed", category=category, error=str(e)))
-                continue
+
+        try:
+            report = Diagnoser.get_cached_report(category)
+        except Exception as e:
+            logger.error(m18n.n("diagnosis_failed", category=category, error=str(e)))
+            continue
+
+        Diagnoser.i18n(report, force_remove_html_tags=share or human_readable)
 
         add_ignore_flag_to_issues(report)
         if not full:
@@ -107,8 +125,11 @@ def diagnosis_show(categories=[], issues=False, full=False, share=False):
             return {"url": url}
         else:
             return
+    elif human_readable:
+        print(_dump_human_readable_reports(all_reports))
     else:
         return {"reports": all_reports}
+
 
 def _dump_human_readable_reports(reports):
 
@@ -121,14 +142,17 @@ def _dump_human_readable_reports(reports):
         for item in report["items"]:
             output += "[{status}] {summary}\n".format(**item)
             for detail in item.get("details", []):
-                output += "  - " + detail + "\n"
+                output += "  - " + detail.replace("\n", "\n    ") + "\n"
             output += "\n"
         output += "\n\n"
 
     return(output)
 
 
-def diagnosis_run(categories=[], force=False):
+def diagnosis_run(categories=[], force=False, except_if_never_ran_yet=False, email=False):
+
+    if (email or except_if_never_ran_yet) and not os.path.exists(DIAGNOSIS_CACHE):
+        return
 
     # Get all the categories
     all_categories = _list_diagnosis_categories()
@@ -151,20 +175,18 @@ def diagnosis_run(categories=[], force=False):
 
         try:
             code, report = hook_exec(path, args={"force": force}, env=None)
-        except Exception as e:
-            logger.error(m18n.n("diagnosis_failed_for_category", category=category, error=str(e)), exc_info=True)
+        except Exception:
+            import traceback
+            logger.error(m18n.n("diagnosis_failed_for_category", category=category, error='\n'+traceback.format_exc()))
         else:
             diagnosed_categories.append(category)
             if report != {}:
                 issues.extend([item for item in report["items"] if item["status"] in ["WARNING", "ERROR"]])
 
-    if issues:
-        if msettings.get("interface") == "api":
-            logger.info(m18n.n("diagnosis_display_tip_web"))
-        else:
-            logger.info(m18n.n("diagnosis_display_tip_cli"))
-
-    return
+    if email:
+        _email_diagnosis_issues()
+    if issues and msettings.get("interface") == "cli":
+        logger.warning(m18n.n("diagnosis_display_tip"))
 
 
 def diagnosis_ignore(add_filter=None, remove_filter=None, list=False):
@@ -221,7 +243,7 @@ def diagnosis_ignore(add_filter=None, remove_filter=None, list=False):
         if category not in all_categories_names:
             raise YunohostError("%s is not a diagnosis category" % category)
         if any("=" not in criteria for criteria in filter_[1:]):
-            raise YunohostError("Extra criterias should be of the form key=value (e.g. domain=yolo.test)")
+            raise YunohostError("Criterias should be of the form key=value (e.g. domain=yolo.test)")
 
         # Convert the provided criteria into a nice dict
         criterias = {c.split("=")[0]: c.split("=")[1] for c in filter_[1:]}
@@ -301,6 +323,7 @@ def issue_matches_criterias(issue, criterias):
             return False
     return True
 
+
 def add_ignore_flag_to_issues(report):
     """
     Iterate over issues in a report, and flag them as ignored if they match an
@@ -356,14 +379,21 @@ class Diagnoser():
 
         for dependency in self.dependencies:
             dep_report = Diagnoser.get_cached_report(dependency)
-            dep_errors = [item for item in dep_report["items"] if item["status"] == "ERROR"]
+
+            if dep_report["timestamp"] == -1:  # No cache yet for this dep
+                dep_errors = True
+            else:
+                dep_errors = [item for item in dep_report["items"] if item["status"] == "ERROR"]
+
             if dep_errors:
                 logger.error(m18n.n("diagnosis_cant_run_because_of_dep", category=self.description, dep=Diagnoser.get_description(dependency)))
                 return 1, {}
 
-        self.logger_debug("Running diagnostic for %s" % self.id_)
-
         items = list(self.run())
+
+        for item in items:
+            if "details" in item and not item["details"]:
+                del item["details"]
 
         new_report = {"id": self.id_,
                       "cached_for": self.cache_duration,
@@ -396,22 +426,36 @@ class Diagnoser():
         return os.path.join(DIAGNOSIS_CACHE, "%s.json" % id_)
 
     @staticmethod
-    def get_cached_report(id_):
-        filename = Diagnoser.cache_file(id_)
-        report = read_json(filename)
-        report["timestamp"] = int(os.path.getmtime(filename))
-        Diagnoser.i18n(report)
-        return report
+    def get_cached_report(id_, item=None, warn_if_no_cache=True):
+        cache_file = Diagnoser.cache_file(id_)
+        if not os.path.exists(cache_file):
+            if warn_if_no_cache:
+                logger.warning(m18n.n("diagnosis_no_cache", category=id_))
+            report = {"id": id_,
+                      "cached_for": -1,
+                      "timestamp": -1,
+                      "items": []}
+        else:
+            report = read_json(cache_file)
+            report["timestamp"] = int(os.path.getmtime(cache_file))
+
+        if item:
+            for report_item in report["items"]:
+                if report_item.get("meta") == item:
+                    return report_item
+            return {}
+        else:
+            return report
 
     @staticmethod
     def get_description(id_):
         key = "diagnosis_description_" + id_
         descr = m18n.n(key)
         # If no description available, fallback to id
-        return descr if descr != key else id_
+        return descr if descr.decode('utf-8') != key else id_
 
     @staticmethod
-    def i18n(report):
+    def i18n(report, force_remove_html_tags=False):
 
         # "Render" the strings with m18n.n
         # N.B. : we do those m18n.n right now instead of saving the already-translated report
@@ -422,11 +466,84 @@ class Diagnoser():
         report["description"] = Diagnoser.get_description(report["id"])
 
         for item in report["items"]:
-            summary_key, summary_args = item["summary"]
-            item["summary"] = m18n.n(summary_key, **summary_args)
+
+            # For the summary and each details, we want to call
+            # m18n() on the string, with the appropriate data for string
+            # formatting which can come from :
+            # - infos super-specific to the summary/details (if it's a tuple(key,dict_with_info) and not just a string)
+            # - 'meta' info = parameters of the test (e.g. which domain/category for DNS conf record)
+            # - actual 'data' retrieved from the test (e.g. actual global IP, ...)
+
+            meta_data = item.get("meta", {}).copy()
+            meta_data.update(item.get("data", {}))
+
+            html_tags = re.compile(r'<[^>]+>')
+            def m18n_(info):
+                if not isinstance(info, tuple) and not isinstance(info, list):
+                    info = (info, {})
+                info[1].update(meta_data)
+                s = m18n.n(info[0], **(info[1]))
+                # In cli, we remove the html tags
+                if msettings.get("interface") != "api" or force_remove_html_tags:
+                    s = s.replace("<cmd>", "'").replace("</cmd>", "'")
+                    s = html_tags.sub('', s.replace("<br>","\n"))
+                else:
+                    s = s.replace("<cmd>", "<code class='cmd'>").replace("</cmd>", "</code>")
+                    # Make it so that links open in new tabs
+                    s = s.replace("<a href=", "<a target='_blank' rel='noopener noreferrer' href=")
+                return s
+
+            item["summary"] = m18n_(item["summary"])
 
             if "details" in item:
-                item["details"] = [m18n.n(key, *values) for key, values in item["details"]]
+                item["details"] = [m18n_(info) for info in item["details"]]
+
+    @staticmethod
+    def remote_diagnosis(uri, data, ipversion, timeout=30):
+
+        # Lazy loading for performance
+        import requests
+        import socket
+
+        # Monkey patch socket.getaddrinfo to force request() to happen in ipv4
+        # or 6 ...
+        # Inspired by https://stackoverflow.com/a/50044152
+        old_getaddrinfo = socket.getaddrinfo
+
+        def getaddrinfo_ipv4_only(*args, **kwargs):
+            responses = old_getaddrinfo(*args, **kwargs)
+            return [response
+                    for response in responses
+                    if response[0] == socket.AF_INET]
+
+        def getaddrinfo_ipv6_only(*args, **kwargs):
+            responses = old_getaddrinfo(*args, **kwargs)
+            return [response
+                    for response in responses
+                    if response[0] == socket.AF_INET6]
+
+        if ipversion == 4:
+            socket.getaddrinfo = getaddrinfo_ipv4_only
+        elif ipversion == 6:
+            socket.getaddrinfo = getaddrinfo_ipv6_only
+
+        url = 'https://%s/%s' % (DIAGNOSIS_SERVER, uri)
+        try:
+            r = requests.post(url, json=data, timeout=timeout)
+        finally:
+            socket.getaddrinfo = old_getaddrinfo
+
+        if r.status_code not in [200, 400]:
+            raise Exception("The remote diagnosis server failed miserably while trying to diagnose your server. This is most likely an error on Yunohost's infrastructure and not on your side. Please contact the YunoHost team an provide them with the following information.<br>URL: <code>%s</code><br>Status code: <code>%s</code>" % (url, r.status_code))
+        if r.status_code == 400:
+            raise Exception("Diagnosis request was refused: %s" % r.content)
+
+        try:
+            r = r.json()
+        except Exception as e:
+            raise Exception("Failed to parse json from diagnosis server response.\nError: %s\nOriginal content: %s" % (e, r.content))
+
+        return r
 
 
 def _list_diagnosis_categories():
@@ -437,3 +554,35 @@ def _list_diagnosis_categories():
             hooks.append((name, info["path"]))
 
     return hooks
+
+
+def _email_diagnosis_issues():
+    from yunohost.domain import _get_maindomain
+    maindomain = _get_maindomain()
+    from_ = "diagnosis@%s (Automatic diagnosis on %s)" % (maindomain, maindomain)
+    to_ = "root"
+    subject_ = "Issues found by automatic diagnosis on %s" % maindomain
+
+    disclaimer = "The automatic diagnosis on your YunoHost server identified some issues on your server. You will find a description of the issues below. You can manage those issues in the 'Diagnosis' section in your webadmin."
+
+    issues = diagnosis_show(issues=True)["reports"]
+    if not issues:
+        return
+
+    content = _dump_human_readable_reports(issues)
+
+    message = """\
+From: %s
+To: %s
+Subject: %s
+
+%s
+
+---
+
+%s
+""" % (from_, to_, subject_, disclaimer, content)
+
+    smtp = smtplib.SMTP("localhost")
+    smtp.sendmail(from_, [to_], message)
+    smtp.quit()
